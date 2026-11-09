@@ -358,7 +358,7 @@ def train_normal_ann():
         "Test_2024": calculate_metrics(y_test, pred_test)
     }
 
-    model_path = MODEL_DIR / "NN_normal_2016_2022_300.pth"
+    model_path = MODEL_DIR / f"NN_normal_2016_2022_{HIDDEN_NEURONS}.pth"
     torch.save(net.cpu().state_dict(), model_path)
 
     results = {

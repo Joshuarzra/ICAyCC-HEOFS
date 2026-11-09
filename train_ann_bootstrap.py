@@ -275,7 +275,7 @@ def main():
         bootstrap_result = train_ann_dataframe(
             df=df_bootstrap,
             hidden_neurons=ANN_SPECIAL_HIDDEN,
-            model_save_path=MODEL_DIR / f"NN_especial_bootstrap_{n_bootstrap}.pth",
+            model_save_path=MODEL_DIR / f"NN_especial_bootstrap_{n_bootstrap}_{ANN_SPECIAL_HIDDEN}.pth",
             model_name=f"C-ANN - bootstrap {n_bootstrap}",
             seed=GLOBAL_SEED + j + 1
         )

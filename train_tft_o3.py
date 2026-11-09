@@ -29,7 +29,7 @@ MAX_PREDICTION_LENGTH = 72
 BATCH_SIZE = 64
 
 LEARNING_RATE = 1e-3
-MAX_EPOCHS = 1 # Configured for testing
+MAX_EPOCHS = 2 # Configured for testing
 
 MODEL_NAME = "O3_72h_test"
 
