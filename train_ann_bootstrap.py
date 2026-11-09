@@ -1,4 +1,6 @@
+import os
 from pathlib import Path
+import sys
 import time
 import random
 import numpy as np
@@ -6,22 +8,20 @@ import pandas as pd
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import matplotlib.pyplot as plt
+from torch.utils.data import TensorDataset, DataLoader, SubsetRandomSampler
 from scipy.stats import pearsonr
-from torch.utils.data import TensorDataset, DataLoader
-from red_neuronal import RedNeuronalSimple
 
 
 PROJECT_DIR = Path(__file__).resolve().parent
-EXCEEDANCE_FILE = PROJECT_DIR / "Data_excedence_2016_2023.xlsx"
-TRAIN_VALIDATION_FILE = PROJECT_DIR / "Data_2016_2023.xlsx"
-TEST_FILE = PROJECT_DIR / "Data_2024.xlsx"
-OUTPUT_DIR = PROJECT_DIR / "ANN_BOOTSTRAP_results"
-BOOTSTRAP_DIR = OUTPUT_DIR / "bootstrap_datasets"
-MODEL_DIR = OUTPUT_DIR / "models"
-FIGURE_DIR = OUTPUT_DIR / "figures"
+sys.path.insert(0, str(PROJECT_DIR))
 
-FEATURES = [
+from red_neuronal import RedNeuronalSimple
+ANN_EXCEDANCE_DATA = PROJECT_DIR / "Data_excedence_2016_2023.xlsx"
+OUTPUT_DIR = PROJECT_DIR / "C-ANN results"
+BOOTSTRAP_DIR = OUTPUT_DIR / "Bootstrap datasets"
+MODEL_DIR = PROJECT_DIR / "models"
+
+ANN_FEATURES = [
     "month",
     "hour",
     "NO2",
@@ -34,26 +34,24 @@ FEATURES = [
     "WSP"
 ]
 
-TARGET = "O3"
-CONTINGENCY_THRESHOLD = 155
-HIDDEN_NEURONS = 60
-BOOTSTRAP_SIZES = [500, 1000, 1500, 2000, 3000, 5000]
-BATCH_SIZE = 64
-LEARNING_RATE = 0.001
-MAX_EPOCHS = 10000
-PATIENCE = 500
-MIN_DELTA = 0.0001
+ANN_TARGET = "O3"
+ANN_SPECIAL_HIDDEN = 60 # Set for testing purposes; can be adjusted for final training
+ANN_LEARNING_RATE = 0.001
+ANN_MAX_EPOCHS = 10000
+ANN_BATCH_SIZE = 64
+ANN_PATIENCE = 500
+ANN_MIN_DELTA = 0.0001
+BOOTSTRAP_SIZES = [2000] 
 GLOBAL_SEED = 42
-
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 BOOTSTRAP_DIR.mkdir(parents=True, exist_ok=True)
 MODEL_DIR.mkdir(parents=True, exist_ok=True)
-FIGURE_DIR.mkdir(parents=True, exist_ok=True)
 
 
-def fijar_semilla(seed=GLOBAL_SEED):
+
+def set_seed(seed=GLOBAL_SEED):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -63,259 +61,229 @@ def fijar_semilla(seed=GLOBAL_SEED):
     torch.backends.cudnn.benchmark = False
 
 
-def cargar_particiones():
-    df_exceedance = pd.read_excel(EXCEEDANCE_FILE, engine="openpyxl")
-    df_exceedance["year"] = pd.to_numeric(df_exceedance["year"], errors="coerce")
-    df_exceedance = df_exceedance[FEATURES + [TARGET, "year"]].dropna().reset_index(drop=True)
+def load_ann_data(file_path, features=ANN_FEATURES, target=ANN_TARGET):
+    df = pd.read_excel(file_path, engine="openpyxl")
+    df_model = df[features + [target]].copy()
+    df_model = df_model.dropna().reset_index(drop=True)
 
-    df_train_pool = df_exceedance[df_exceedance["year"] <= 2022].copy()
-    df_validation = pd.read_excel(TRAIN_VALIDATION_FILE, engine="openpyxl")
-    df_validation["datetime"] = pd.to_datetime(df_validation["date"], errors="coerce")
-    df_validation = df_validation.dropna(subset=["datetime"]).copy()
-    df_val = df_validation[df_validation["datetime"].dt.year == 2023].copy()
-    df_val = df_val[FEATURES + [TARGET]].dropna().reset_index(drop=True)
+    for col in features + [target]:
+        df_model[col] = pd.to_numeric(df_model[col], errors="coerce")
 
-    df_test = pd.read_excel(TEST_FILE, engine="openpyxl")
-    df_test["datetime"] = pd.to_datetime(df_test["date"], errors="coerce")
-    df_test = df_test.dropna(subset=["datetime"]).copy()
-    df_test = df_test[df_test["datetime"].dt.year == 2024].copy()
-    df_test = df_test[FEATURES + [TARGET]].dropna().reset_index(drop=True)
+    df_model = df_model.dropna().reset_index(drop=True)
+    X = df_model[features].values.astype(np.float32)
+    Y = df_model[target].values.astype(np.float32).reshape(-1, 1)
 
-    X_val = df_val[FEATURES].to_numpy(dtype=np.float32)
-    y_val = df_val[TARGET].to_numpy(dtype=np.float32).reshape(-1, 1)
-    X_test = df_test[FEATURES].to_numpy(dtype=np.float32)
-    y_test = df_test[TARGET].to_numpy(dtype=np.float32).reshape(-1, 1)
+    print(f"File: {file_path}")
+    print(f"Samples: {len(X):,}")
+    print(f"Features: {X.shape[1]}")
+    print(f"Target: {Y.shape[1]}")
 
-    print(f"Pool de excedencias para entrenamiento 2016-2022: {len(df_train_pool):,}")
-    print(f"Validation 2023: {len(df_val):,}")
-    print(f"Test 2024: {len(df_test):,}")
-
-    return df_train_pool, X_val, y_val, X_test, y_test
+    return df_model, X, Y
 
 
-def calcular_metricas(y_real, y_pred):
-    y_real = np.asarray(y_real).reshape(-1)
-    y_pred = np.asarray(y_pred).reshape(-1)
-    r, _ = pearsonr(y_real, y_pred)
-    rmse = np.sqrt(np.mean((y_pred - y_real) ** 2))
-    mae = np.mean(np.abs(y_pred - y_real))
-    bias = np.mean(y_pred - y_real)
-    r2 = 1 - np.sum((y_real - y_pred) ** 2) / np.sum((y_real - np.mean(y_real)) ** 2)
-    return {"R": r, "RMSE": rmse, "MAE": mae, "Bias": bias, "R2": r2}
+def create_bootstrap_dataframe(df, n_samples, seed=GLOBAL_SEED):
+    rng = np.random.default_rng(seed)
+    indices = rng.choice(len(df), size=n_samples, replace=True)
+    return df.iloc[indices].copy().reset_index(drop=True)
 
 
-def crear_bootstraps(df_train_pool):
-    datasets = {}
+def generate_contingency_bootstraps(file_path=ANN_EXCEDANCE_DATA, sample_sizes=BOOTSTRAP_SIZES, output_dir=BOOTSTRAP_DIR, seed=GLOBAL_SEED):
+    bootstrap_results = {}
+    df = pd.read_excel(file_path, engine="openpyxl")
 
-    for index, size in enumerate(BOOTSTRAP_SIZES):
-        rng = np.random.default_rng(GLOBAL_SEED + index)
-        indices = rng.choice(len(df_train_pool), size=size, replace=True)
-        bootstrap_df = df_train_pool.iloc[indices].copy().reset_index(drop=True)
-        bootstrap_path = BOOTSTRAP_DIR / f"Data_excedence_bootstrap_{size}.xlsx"
-        bootstrap_df.to_excel(bootstrap_path, index=False, engine="openpyxl")
-        datasets[size] = bootstrap_df
-        print(f"Bootstrap {size}: {bootstrap_path}")
+    print(f"Original exceedance dataset: {len(df):,} rows")
 
-    return datasets
+    for j, n_samples in enumerate(sample_sizes):
+        df_boot = create_bootstrap_dataframe(df, n_samples, seed=seed + j)
+        file_name = f"Data_excedence_bootstrap_{n_samples}.xlsx"
+        file_path = output_dir / file_name
+        df_boot.to_excel(file_path, index=False, engine="openpyxl")
+        bootstrap_results[n_samples] = df_boot
+        print(f"Bootstrap {n_samples:>5,}: {len(df_boot):,} rows -> {file_path}")
 
-
-def crear_loader(X, y, shuffle):
-    dataset = TensorDataset(torch.from_numpy(X).float(), torch.from_numpy(y).float())
-    return DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=shuffle)
+    return bootstrap_results
 
 
-def predecir(model, X):
-    model.eval()
-    with torch.no_grad():
-        prediction = model(torch.from_numpy(X).float().to(DEVICE)).cpu().numpy().reshape(-1)
-    return np.maximum(prediction, 0.0)
+def train_ann_dataframe(
+    df,
+    hidden_neurons,
+    model_save_path,
+    model_name="ANN",
+    seed=GLOBAL_SEED,
+    train_ratio=0.70,
+    val_ratio=0.15
+):
+    set_seed(seed)
 
+    data = df[ANN_FEATURES + [ANN_TARGET]].copy().dropna().reset_index(drop=True)
 
-def graficar_regresion(particiones, output_path, title):
-    fig, axes = plt.subplots(1, len(particiones), figsize=(5 * len(particiones), 4.8))
-    axes = np.atleast_1d(axes)
-    values = []
+    for col in ANN_FEATURES + [ANN_TARGET]:
+        data[col] = pd.to_numeric(data[col], errors="coerce")
 
-    for target, output in particiones.values():
-        valid = np.isfinite(target) & np.isfinite(output) & (target >= 0) & (output >= 0)
-        values.extend(target[valid].tolist())
-        values.extend(output[valid].tolist())
+    data = data.dropna().reset_index(drop=True)
 
-    upper = max(values) * 1.03 if values else 1.0
-    upper = max(upper, 1.0)
+    X_np = data[ANN_FEATURES].values.astype(np.float32)
+    T_np = data[ANN_TARGET].values.astype(np.float32).reshape(-1, 1)
 
-    for ax, (name, (target, output)) in zip(axes, particiones.items()):
-        valid = np.isfinite(target) & np.isfinite(output) & (target >= 0) & (output >= 0)
-        target = target[valid]
-        output = output[valid]
-        r, _ = pearsonr(target, output)
-        ax.scatter(target, output, s=10, alpha=0.45)
-        ax.plot([0, upper], [0, upper], linestyle="--", linewidth=1.5, label="Y = T")
-        ax.set_title(f"{name} (R = {r:.3f})")
-        ax.set_xlabel("Target")
-        ax.set_ylabel("Output")
-        ax.set_xlim(0, upper)
-        ax.set_ylim(0, upper)
-        ax.grid(True, alpha=0.25)
-        ax.legend(loc="upper left")
+    n_samples = len(X_np)
+    input_size = X_np.shape[1]
+    output_size = 1
 
-    fig.suptitle(title, fontsize=13)
-    fig.tight_layout(rect=[0, 0, 1, 0.90])
-    fig.savefig(output_path, dpi=300, bbox_inches="tight")
-    plt.close(fig)
+    print(f"\nTRAINING: {model_name}")
+    print(f"Samples: {n_samples:,}")
+    print(f"Inputs: {input_size}")
+    print(f"Hidden neurons: {hidden_neurons}")
 
+    X_tensor = torch.from_numpy(X_np).float()
+    T_tensor = torch.from_numpy(T_np).float()
+    dataset = TensorDataset(X_tensor, T_tensor)
 
-def entrenar_bootstrap(df_bootstrap, X_val, y_val, X_test, y_test, size, seed):
-    fijar_semilla(seed)
-
-    X_train = df_bootstrap[FEATURES].to_numpy(dtype=np.float32)
-    y_train = df_bootstrap[TARGET].to_numpy(dtype=np.float32).reshape(-1, 1)
-
-    train_loader = crear_loader(X_train, y_train, True)
-    val_loader = crear_loader(X_val, y_val, False)
-
-    model = RedNeuronalSimple(len(FEATURES), HIDDEN_NEURONS, 1).to(DEVICE)
+    net = RedNeuronalSimple(input_size, hidden_neurons, output_size).to(DEVICE)
     criterion = nn.MSELoss()
-    optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
+    optimizer = optim.Adam(net.parameters(), lr=ANN_LEARNING_RATE)
 
-    best_val_loss = np.inf
-    best_state = None
-    epochs_without_improvement = 0
+    train_size = int(train_ratio * n_samples)
+    val_size = int(val_ratio * n_samples)
+    test_size = n_samples - train_size - val_size
+
+    indices = np.random.permutation(n_samples)
+    train_indices = indices[:train_size]
+    val_indices = indices[train_size:train_size + val_size]
+    test_indices = indices[train_size + val_size:]
+
+    train_sampler = SubsetRandomSampler(train_indices)
+    val_sampler = SubsetRandomSampler(val_indices)
+
+    train_loader = DataLoader(dataset, batch_size=ANN_BATCH_SIZE, sampler=train_sampler)
+    val_loader = DataLoader(dataset, batch_size=ANN_BATCH_SIZE, sampler=val_sampler)
+
+    best_val_loss = float("inf")
+    epochs_no_improve = 0
     start_time = time.time()
 
-    print(f"\nANN especial bootstrap {size}")
-    print(f"Dispositivo: {DEVICE}")
-    print(f"Train bootstrap: {len(X_train):,}")
-    print(f"Validation 2023: {len(X_val):,}")
-    print(f"Test 2024: {len(X_test):,}")
-    print(f"Neuronas ocultas: {HIDDEN_NEURONS}")
+    for epoch in range(ANN_MAX_EPOCHS):
+        net.train()
+        running_loss = 0.0
 
-    for epoch in range(MAX_EPOCHS):
-        model.train()
-        train_loss_sum = 0.0
-
-        for X_batch, y_batch in train_loader:
-            X_batch = X_batch.to(DEVICE)
-            y_batch = y_batch.to(DEVICE)
+        for inputs, targets in train_loader:
+            inputs = inputs.to(DEVICE)
+            targets = targets.to(DEVICE)
             optimizer.zero_grad()
-            prediction = model(X_batch)
-            loss = criterion(prediction, y_batch)
+            outputs = net(inputs)
+            loss = criterion(outputs, targets)
             loss.backward()
             optimizer.step()
-            train_loss_sum += loss.item() * X_batch.size(0)
+            running_loss += loss.item() * inputs.size(0)
 
-        train_loss = train_loss_sum / len(X_train)
+        epoch_loss = running_loss / train_size
 
-        model.eval()
-        val_loss_sum = 0.0
+        net.eval()
+        val_running_loss = 0.0
 
         with torch.no_grad():
-            for X_batch, y_batch in val_loader:
-                X_batch = X_batch.to(DEVICE)
-                y_batch = y_batch.to(DEVICE)
-                prediction = model(X_batch)
-                loss = criterion(prediction, y_batch)
-                val_loss_sum += loss.item() * X_batch.size(0)
+            for inputs, targets in val_loader:
+                inputs = inputs.to(DEVICE)
+                targets = targets.to(DEVICE)
+                outputs = net(inputs)
+                loss = criterion(outputs, targets)
+                val_running_loss += loss.item() * inputs.size(0)
 
-        val_loss = val_loss_sum / len(X_val)
+        val_epoch_loss = val_running_loss / val_size
 
         if (epoch + 1) % 100 == 0:
             print(
-                f"Epoch [{epoch + 1}/{MAX_EPOCHS}] | "
-                f"Train MSE: {train_loss:.6f} | "
-                f"Val MSE: {val_loss:.6f}"
+                f"Epoch {epoch + 1:5d}/{ANN_MAX_EPOCHS} | "
+                f"Train MSE: {epoch_loss:.6f} | "
+                f"Val MSE: {val_epoch_loss:.6f}"
             )
 
-        if val_loss < best_val_loss - MIN_DELTA:
-            best_val_loss = val_loss
-            epochs_without_improvement = 0
+        if val_epoch_loss < best_val_loss - ANN_MIN_DELTA:
+            best_val_loss = val_epoch_loss
+            epochs_no_improve = 0
             best_state = {
                 key: value.detach().cpu().clone()
-                for key, value in model.state_dict().items()
+                for key, value in net.state_dict().items()
             }
         else:
-            epochs_without_improvement += 1
-            if epochs_without_improvement >= PATIENCE:
-                print(f"Early stopping en época {epoch + 1}")
+            epochs_no_improve += 1
+            if epochs_no_improve >= ANN_PATIENCE:
+                print(f"\nEarly stopping at epoch {epoch + 1}")
                 break
 
     training_time = time.time() - start_time
-    model.load_state_dict(best_state)
 
-    pred_train = predecir(model, X_train)
-    pred_val = predecir(model, X_val)
-    pred_test = predecir(model, X_test)
+    if "best_state" in locals():
+        net.load_state_dict(best_state)
 
-    metrics = {
-        "Train_bootstrap": calcular_metricas(y_train, pred_train),
-        "Validation_2023": calcular_metricas(y_val, pred_val),
-        "Test_2024": calcular_metricas(y_test, pred_test)
+    net.eval()
+
+    with torch.no_grad():
+        X_eval = X_tensor.to(DEVICE)
+        Y_pred = net(X_eval).cpu().numpy()
+
+    Y_pred = np.maximum(Y_pred, 0)
+    Y_true = T_np
+
+    R, _ = pearsonr(Y_pred.flatten(), Y_true.flatten())
+    RMSE = np.sqrt(np.mean((Y_pred - Y_true) ** 2))
+    MAE = np.mean(np.abs(Y_pred - Y_true))
+    R2 = 1 - np.sum((Y_true - Y_pred) ** 2) / np.sum((Y_true - Y_true.mean()) ** 2)
+
+    net_cpu = net.to("cpu")
+    torch.save(net_cpu.state_dict(), model_save_path)
+
+    print(f"Training completed: {training_time:.2f} s")
+    print(f"R = {R:.4f}")
+    print(f"RMSE = {RMSE:.4f}")
+    print(f"MAE = {MAE:.4f}")
+    print(f"R2 = {R2:.4f}")
+    print(f"Model saved: {model_save_path}")
+
+    return {
+        "model": net_cpu,
+        "model_name": model_name,
+        "n_samples": n_samples,
+        "hidden_neurons": hidden_neurons,
+        "best_val_mse": best_val_loss,
+        "R": R,
+        "RMSE": RMSE,
+        "MAE": MAE,
+        "R2": R2,
+        "training_time_s": training_time,
+        "model_path": model_save_path
     }
-
-    model_path = MODEL_DIR / f"NN_especial_bootstrap_{size}.pth"
-    torch.save(model.cpu().state_dict(), model_path)
-
-    regression_data = {
-        "Train": (y_train.reshape(-1), pred_train),
-        "Validation": (y_val.reshape(-1), pred_val),
-        "Test": (y_test.reshape(-1), pred_test),
-        "Overall": (
-            np.concatenate([y_train.reshape(-1), y_val.reshape(-1), y_test.reshape(-1)]),
-            np.concatenate([pred_train, pred_val, pred_test])
-        )
-    }
-
-    graficar_regresion(
-        regression_data,
-        FIGURE_DIR / f"NN_especial_bootstrap_{size}_regression_plots.png",
-        f"ANN bootstrap {size}: observed versus predicted O$_3$"
-    )
-
-    rows = []
-    for split, values in metrics.items():
-        rows.append({
-            "bootstrap_size": size,
-            "Partition": split,
-            **values
-        })
-
-    print(f"Tiempo de entrenamiento: {training_time:.2f} s")
-    print(f"Mejor validation MSE: {best_val_loss:.6f}")
-    print(f"Modelo guardado: {model_path}")
-
-    for split, values in metrics.items():
-        print(
-            f"{split}: R={values['R']:.4f}, "
-            f"RMSE={values['RMSE']:.4f}, "
-            f"MAE={values['MAE']:.4f}, "
-            f"Bias={values['Bias']:.4f}, "
-            f"R2={values['R2']:.4f}"
-        )
-
-    return rows
 
 
 def main():
-    df_train_pool, X_val, y_val, X_test, y_test = cargar_particiones()
-    bootstrap_datasets = crear_bootstraps(df_train_pool)
+    set_seed()
 
-    all_metrics = []
+    df_exceedance, X_exceedance, Y_exceedance = load_ann_data(ANN_EXCEDANCE_DATA)
+    original_result = train_ann_dataframe(
+        df=df_exceedance,
+        hidden_neurons=ANN_SPECIAL_HIDDEN,
+        model_save_path=MODEL_DIR / "NN_especial_excedance.pth",
+        model_name="C-ANN - original exceedances",
+        seed=GLOBAL_SEED
+    )
 
-    for index, size in enumerate(BOOTSTRAP_SIZES):
-        rows = entrenar_bootstrap(
-            bootstrap_datasets[size],
-            X_val,
-            y_val,
-            X_test,
-            y_test,
-            size,
-            GLOBAL_SEED + index + 1
+    bootstrap_datasets = generate_contingency_bootstraps()
+
+    for j, n_bootstrap in enumerate(BOOTSTRAP_SIZES):
+        print(f"\nBOOTSTRAP {n_bootstrap:,}")
+        df_bootstrap = bootstrap_datasets[n_bootstrap]
+
+        bootstrap_result = train_ann_dataframe(
+            df=df_bootstrap,
+            hidden_neurons=ANN_SPECIAL_HIDDEN,
+            model_save_path=MODEL_DIR / f"NN_especial_bootstrap_{n_bootstrap}.pth",
+            model_name=f"C-ANN - bootstrap {n_bootstrap}",
+            seed=GLOBAL_SEED + j + 1
         )
-        all_metrics.extend(rows)
 
-    comparison = pd.DataFrame(all_metrics)
-    comparison.to_csv(OUTPUT_DIR / "ANN_bootstrap_metrics.csv", index=False)
-    print(f"\nResultados guardados en: {OUTPUT_DIR}")
+        bootstrap_result["bootstrap_size"] = n_bootstrap
+
+    print(f"Bootstrap datasets saved to: {BOOTSTRAP_DIR}")
+    print(f"Models saved to: {MODEL_DIR}")
 
 
 if __name__ == "__main__":
